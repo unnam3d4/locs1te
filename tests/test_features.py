@@ -203,3 +203,67 @@ class BindingTests(unittest.TestCase):
         self.db.unbind_property(mid,a,'IP')
         self.db.delete_sheet(sid)
         self.assertEqual(self.db.bindings(mid,b),[])
+
+class XLSXTests(unittest.TestCase):
+    def setUp(self):
+        self.folder=tempfile.TemporaryDirectory();self.addCleanup(self.folder.cleanup)
+        self.db=server.DB(Path(self.folder.name)/'data')
+        self.db.create_user('admin','password123','admin')
+
+    def test_xlsx_values_styles_and_roundtrip(self):
+        sid=self.db.add_sheet('Строки')
+        self.db.edit_cell(sid,0,0,'000123',{'bold':True,'bg':'#FAEEDD','align':'center'},0)
+        self.db.edit_cell(sid,4,2,'=A1',{'italic':True,'color':'#123ABC'},0)
+        contents=self.db.xlsx_export(sid)
+        self.assertTrue(contents.startswith(b'PK'))
+        target=self.db.add_sheet('Импорт')
+        self.assertEqual(self.db.xlsx_import(target,contents)['cells'],2)
+        cells=self.db.sheet(target)['cells']
+        self.assertEqual(cells[0]['value'],'000123')
+        self.assertTrue(cells[0]['style']['bold'])
+        self.assertEqual(cells[0]['style']['bg'],'#FAEEDD')
+        self.assertEqual(cells[1]['value'],'=A1')
+        self.assertEqual(cells[1]['style']['color'],'#123ABC')
+        with self.assertRaises(server.Failure):self.db.xlsx_import(target,b'not a zip')
+        self.assertEqual(len(self.db.sheet(target)['cells']),2)
+
+    def test_xlsx_from_known_office_markup(self):
+        import xlsx_io
+        self.assertEqual(xlsx_io.coordinates('BC17'),(16,54))
+        self.assertEqual(xlsx_io.letter(54),'BC')
+        with self.assertRaises(ValueError):xlsx_io.coordinates('A0')
+
+class RevisionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.db=server.DB(Path(self.tmp.name)/'data')
+        self.db.create_user('admin','password123','admin')
+    def test_revision_wait_works_and_no_false_change_on_read(self):
+        import threading,time
+        begin=self.db.revision()
+        self.db.list_sheets()
+        self.assertEqual(self.db.revision(),begin)
+        seen=[]
+        def listener():seen.append(self.db.wait_revision(begin,timeout=3))
+        thread=threading.Thread(target=listener);thread.start();time.sleep(.15)
+        self.db.add_sheet('Панель 1')
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive(),'Possible lock inversion during long-poll')
+        self.assertEqual(len(seen),1)
+        self.assertGreater(seen[0],begin)
+
+class HTTPXLSXTests(HttpFeatureTests):
+    def test_xlsx_authorization_and_export(self):
+        a=self.login('admin');v=self.login('viewer')
+        status,data,_=self.request('POST','/api/sheets',{'title':'XLSX Sheet'},a)
+        sid=json.loads(data)['id']
+        import xlsx_io
+        content=xlsx_io.export_xlsx([{'row_no':0,'col_no':0,'value':'Таблица','style':{'bold':True}}])
+        status,data,_=self.request('POST','/api/sheets/{}/xlsx'.format(sid),content,{'Cookie':v['Cookie'],'X-ITSO-CSRF':v['X-ITSO-CSRF']})
+        self.assertEqual(status,403)
+        status,data,_=self.request('POST','/api/sheets/{}/xlsx'.format(sid),content,{'Cookie':a['Cookie'],'X-ITSO-CSRF':a['X-ITSO-CSRF']})
+        self.assertEqual(status,200)
+        self.assertEqual(json.loads(data)['cells'],1)
+        status,data,_=self.request('GET','/api/sheets/{}/xlsx'.format(sid),headers=v)
+        self.assertEqual(status,200)
+        self.assertEqual(xlsx_io.import_xlsx(data)[0][2],'Таблица')
