@@ -65,6 +65,21 @@ class DatabaseTests(unittest.TestCase):
         self.db.delete_file(first['id'])
         self.assertTrue((self.db.backups/snap/'uploads'/first['id']).exists())
 
+    def test_backup_integrity_reports_missing_attachments(self):
+        self.db.store_upload(1,'manual.bin',io.BytesIO(b'data'),4)
+        stamp=self.db.backup()
+        report=self.db.verify_backup(stamp)
+        self.assertTrue(report['ok'])
+        self.assertEqual(report['files'],1)
+        with self.db.tx() as c:
+            fid=c.execute('SELECT id FROM files').fetchone()[0]
+        (self.db.backups/stamp/'uploads'/fid).unlink()
+        report=self.db.verify_backup(stamp)
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['missing'],[fid])
+        with self.assertRaises(server.Failure):
+            self.db.verify_backup('../bad')
+
     def test_resumable_upload_crash_retry_duplicate_name_and_owner(self):
         data=b'first-chunk and remaining-chunk'
         first=self.db.start_upload(1,'Фото камеры.jpg',len(data))
