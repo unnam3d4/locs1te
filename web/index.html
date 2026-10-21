@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>БАЗА ДАННЫХ ИТСО</title><link rel="stylesheet" href="/app.css"></head>
+<body>
+<div id="login" class="login-screen">
+  <section class="dialog login-dialog">
+    <div class="title-bar">БАЗА ДАННЫХ ИТСО — Вход</div>
+    <div class="dialog-content">
+      <div class="login-picture" aria-hidden="true">ITSO</div>
+      <label>Пользователь<input id="login-name" autocomplete="username"></label>
+      <label>Пароль<input id="login-password" type="password" autocomplete="current-password"></label>
+      <p id="login-error" class="error" role="alert"></p>
+      <button id="login-btn">Войти</button>
+      <p class="muted">Локальная сеть. Соединение HTTP не зашифровано.</p>
+    </div>
+  </section>
+</div>
+<div id="shell" hidden>
+  <header class="window-header"><div class="title-bar title-main"><span>БАЗА ДАННЫХ ИТСО</span><div><span id="identity"></span><button id="logout-btn">Выход</button></div></div></header>
+  <div class="workspace">
+    <nav class="sidebar" aria-label="Разделы программы">
+      <button data-view="search" class="nav-active"><span class="nav-square"></span>Поиск</button>
+      <button data-view="tables"><span class="nav-square"></span>Таблицы</button>
+      <button data-view="maps"><span class="nav-square"></span>Карты</button>
+      <button data-view="files"><span class="nav-square"></span>Обменник</button>
+      <button data-view="chat"><span class="nav-square"></span>Чат <small id="unread"></small></button>
+      <div class="sidebar-bottom">Windows 98 SE style<br>Локальная база данных</div>
+    </nav>
+    <main class="main-panel">
+      <div id="panel-heading" class="pane-heading">Поиск</div>
+      <div id="panel" class="panel-body"></div>
+    </main>
+  </div>
+  <footer class="status-bar"><span id="status">Готово</span><span id="connection">LAN / HTTP</span></footer>
+</div>
+<div id="toast" class="toast" hidden role="status"></div>
+<script src="/app.js"></script>
+</body></html>
