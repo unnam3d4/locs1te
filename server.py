@@ -542,6 +542,38 @@ class DB:
         found.sort(key=lambda x:(x['section'],x['label'].casefold()))
         return {'total':len(found),'counts':counts,'items':found[(page-1)*50:page*50]}
 
+    def verify_backup(self, stamp):
+        """Read-only SQLite integrity and attachment consistency report."""
+        if not re.fullmatch(r'\d{8}_\d{6}_\d{6}', str(stamp)):
+            raise Failure('Некорректное имя резервной копии')
+        target = self.backups / stamp
+        snap = target / 'itso.db'
+        if not snap.is_file():
+            raise Failure('Резервная копия не найдена', 404)
+        try:
+            with contextlib.closing(sqlite3.connect(str(snap))) as c:
+                result = c.execute('PRAGMA integrity_check').fetchone()
+                if not result or result[0] != 'ok':
+                    raise Failure('Нарушена целостность SQLite', 409)
+                rows = c.execute('SELECT id,byte_length FROM files').fetchall()
+        except sqlite3.DatabaseError as e:
+            raise Failure('Не удалось проверить SQLite: {}'.format(e), 409)
+        missing = []
+        wrong_size = []
+        for fid, size in rows:
+            path = target / 'uploads' / fid
+            if not path.is_file():
+                missing.append(fid)
+            elif path.stat().st_size != size:
+                wrong_size.append(fid)
+        return {'name': stamp, 'sqlite_ok': True, 'files': len(rows),
+                'missing': missing, 'wrong_size': wrong_size,
+                'ok': not missing and not wrong_size}
+
+    def list_backups(self):
+        return [x.name for x in sorted(self.backups.iterdir(), reverse=True)
+                if x.is_dir() and re.fullmatch(r'\d{8}_\d{6}_\d{6}', x.name)]
+
     def backup(self):
         stamp=dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         target=self.backups/stamp
@@ -1183,6 +1215,7 @@ def main(argv=None):
     p.add_argument('--init-admin',action='store_true',help='Create the first admin interactively')
     p.add_argument('--add-user',action='store_true',help='Add a user after checking administrator credentials')
     p.add_argument('--backup-now',action='store_true',help='Create an immediate backup')
+    p.add_argument('--verify-backups',action='store_true',help='Inspect backup integrity and attachments')
     p.add_argument('--export-archive',help='Create portable validated complete ZIP archive at target path')
     p.add_argument('--restore-archive',help='Restore ZIP archive OFFLINE; requires admin password')
     args=p.parse_args(argv)
@@ -1227,6 +1260,12 @@ def main(argv=None):
         db.restore_archive(args.restore_archive);print('Восстановлено. Перезапустите сервер.');return
     if args.backup_now:
         print('Резервная копия:', db.backup())
+        return
+    if args.verify_backups:
+        results = [db.verify_backup(stamp) for stamp in db.list_backups()]
+        print(dump({'checked':len(results),'backups':results}))
+        if any(not result['ok'] for result in results):
+            raise SystemExit(2)
         return
     stop=threading.Event()
     worker=threading.Thread(target=hourly_backup,args=(db,stop),daemon=True)
