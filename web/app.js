@@ -5,7 +5,7 @@ var $ = function(id){return document.getElementById(id);};
 var state = {user:null,csrf:'',view:'search',sheets:[],maps:[],currentSheet:0,currentMap:0,
   search:{q:'',page:1,section:'all',scope:'',exact:false,results:null,dirty:false},
   selectedCell:null,selectedObject:null,connectSource:null,mapData:null,zoom:1,
-  lastChatId:0,timer:null,searchTimer:null,undo:[],redo:[],chatTimer:null};
+  lastChatId:0,timer:null,searchTimer:null,undo:[],redo:[],chatTimer:null,watchGeneration:0,revision:0};
 function escapeHtml(x){return String(x==null?'':x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function toast(message){var t=$('toast');t.textContent=message;t.hidden=false;clearTimeout(state.timer);state.timer=setTimeout(function(){t.hidden=true;},5000);}
 function status(s){$('status').textContent=s;}
@@ -18,15 +18,20 @@ function query(path,opts){opts=opts||{};var init={method:opts.method||'GET',cred
     if(/Войдите в систему/.test(e.message)){showLogin();}throw e;
   });}
 function safe(fn){return Promise.resolve().then(fn).catch(function(e){toast(e.message||String(e));status('Ошибка: '+(e.message||e));});}
-function showLogin(){if(state.chatTimer){clearInterval(state.chatTimer);state.chatTimer=null;}$('login').hidden=false;$('shell').hidden=true;state.user=null;state.csrf='';state.mapData=null;state.sheetData=null;state.cellLookup={};state.search={q:'',page:1,section:'all',scope:'',exact:false,results:null,dirty:false};}
+function showLogin(){state.watchGeneration++;$('remote-change').hidden=true;if(state.chatTimer){clearInterval(state.chatTimer);state.chatTimer=null;}$('login').hidden=false;$('shell').hidden=true;state.user=null;state.csrf='';state.mapData=null;state.sheetData=null;state.cellLookup={};state.search={q:'',page:1,section:'all',scope:'',exact:false,results:null,dirty:false};}
 function login(){$('login-error').textContent='';safe(function(){return query('/api/login',{method:'POST',body:{name:$('login-name').value,password:$('login-password').value}}).then(function(d){
   state.user=d.user;state.csrf=d.csrf;initShell();});});}
 function initShell(){$('login').hidden=true;$('shell').hidden=false;$('login-password').value='';$('identity').textContent=state.user.name+' · '+({admin:'Администратор',editor:'Редактор',observer:'Наблюдатель'}[state.user.role]);
-  navigate('search');if(!state.chatTimer){refreshUnread();state.chatTimer=setInterval(refreshUnread,15000);}setInterval(function(){if(!state.user)return;query('/api/me').then(function(d){var left=d.expires-Math.floor(Date.now()/1000);if(left<300&&left>0&&left>=280)toast('Сеанс скоро завершится. Сохраните изменения.');}).catch(function(){});},60000);
+  navigate('search');startChangesWatch();if(!state.chatTimer){refreshUnread();state.chatTimer=setInterval(refreshUnread,15000);}setInterval(function(){if(!state.user)return;query('/api/me').then(function(d){var left=d.expires-Math.floor(Date.now()/1000);if(left<300&&left>0&&left>=280)toast('Сеанс скоро завершится. Сохраните изменения.');}).catch(function(){});},60000);
 }
+function startChangesWatch(){var ticket=++state.watchGeneration;query('/api/revision').then(function(d){state.revision=d.rev;watch(ticket);}).catch(function(){});}
+function watch(ticket){if(ticket!==state.watchGeneration||!state.user)return;query('/api/changes?since='+state.revision).then(function(d){if(ticket!==state.watchGeneration||!state.user)return;
+ if(d.rev>state.revision){state.revision=d.rev;$('remote-change').hidden=false;if(state.view==='chat')refreshUnread();if(state.view==='search')state.search.dirty=true;}
+ watch(ticket);
+ }).catch(function(){if(ticket===state.watchGeneration&&state.user)setTimeout(function(){watch(ticket);},4500);});}
 function refreshUnread(){if(!state.user)return;query('/api/chat/unread').then(function(d){$('unread').textContent=d.count?('('+d.count+')'):'';}).catch(function(){});}
 function writable(){return state.user&&(state.user.role==='admin'||state.user.role==='editor');}
-function navigate(section){state.view=section;state.selectedObject=null;document.querySelectorAll('[data-view]').forEach(function(b){b.classList.toggle('nav-active',b.dataset.view===section);});
+function navigate(section){$('remote-change').hidden=true;state.view=section;state.selectedObject=null;document.querySelectorAll('[data-view]').forEach(function(b){b.classList.toggle('nav-active',b.dataset.view===section);});
   $('panel-heading').textContent={search:'Поиск',tables:'Таблицы',maps:'Карты',files:'Обменник',chat:'Чат'}[section];
   safe(function(){return ({search:renderSearch,tables:renderTables,maps:renderMaps,files:renderFiles,chat:renderChat})[section]();});}
 function renderSearch(){var s=state.search;$('panel').innerHTML='<div class="toolbar"><input id="q" type="search" placeholder="Название, IP, номер или текст" style="flex:1;min-width:200px"><button id="go">Найти</button><label><input id="exact" type="checkbox"> Точное совпадение</label></div>'+
@@ -74,7 +79,7 @@ function renderTables(){return loadSheetList().then(function(){var panel=$('pane
  if(state.currentSheet)return loadSheet(state.currentSheet);});}
 function cellKey(r,c){return r+':'+c;}
 function loadSheet(id){return query('/api/sheets/'+id).then(function(d){if(state.view!=='tables')return;state.sheetData=d;var lookup={};d.cells.forEach(function(c){lookup[cellKey(c.row_no,c.col_no)]=c;});state.cellLookup=lookup;
- $('sheet-toolbar').innerHTML='<span>'+escapeHtml(d.sheet.title)+'</span><a href="/api/sheets/'+id+'/csv" download="table.csv" class="small">Экспорт CSV</a>'+(writable()?'<button id="bold-cell" class="small">Жирный</button><button id="fill-cell" class="small">Заливка</button><button id="undo-cell" class="small">Отменить</button><button id="redo-cell" class="small">Повторить</button><button id="import-csv" class="small">Импорт CSV</button>':'')+'<span class="muted">Двойной щелчок — изменить ячейку</span>';
+ $('sheet-toolbar').innerHTML='<span>'+escapeHtml(d.sheet.title)+'</span><a href="/api/sheets/'+id+'/csv" download="table.csv" class="small">CSV ↓</a><a href="/api/sheets/'+id+'/xlsx" download="table.xlsx" class="small">XLSX ↓</a>'+(writable()?'<button id="bold-cell" class="small">Жирный</button><button id="fill-cell" class="small">Заливка</button><button id="undo-cell" class="small">Отменить</button><button id="redo-cell" class="small">Повторить</button><button id="import-csv" class="small">CSV ↑</button><button id="import-xlsx" class="small">XLSX ↑</button>':'')+'<span class="muted">Двойной щелчок — изменить ячейку</span>';
  var html='<table class="edit-grid"><thead><tr><th class="row-heading"></th>';
  for(var col=0;col<12;col++)html+='<th>'+String.fromCharCode(65+col)+'</th>';html+='</tr></thead><tbody>';
  for(var row=0;row<65;row++){html+='<tr><th class="row-heading">'+(row+1)+'</th>';for(var col=0;col<12;col++){
@@ -84,6 +89,8 @@ function loadSheet(id){return query('/api/sheets/'+id).then(function(d){if(state
  $('sheet-grid').innerHTML=html;$('sheet-grid').querySelectorAll('td').forEach(function(td){td.onclick=function(){selectCell(this);};td.ondblclick=function(){selectCell(this);editCell();};});
  if(writable()){$('bold-cell').onclick=function(){changeStyle('bold');};$('fill-cell').onclick=function(){changeStyle('fill');};
  $('undo-cell').onclick=function(){safe(function(){return undoCell(false);});};$('redo-cell').onclick=function(){safe(function(){return undoCell(true);});};
+ $('import-xlsx').onclick=function(){var input=document.createElement('input');input.type='file';input.accept='.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';input.onchange=function(){var file=input.files[0];if(!file)return;if(file.size>16*1024*1024){toast('XLSX больше 16 МиБ');return;}if(!confirm('Заменить ВСЁ содержимое таблицы импортом первого листа XLSX?'))return;
+ safe(function(){return fetch('/api/sheets/'+id+'/xlsx',{method:'POST',credentials:'same-origin',headers:{'X-ITSO-CSRF':state.csrf},body:file}).then(function(r){return r.json().then(function(d){if(!r.ok)throw Error(d.error||'Ошибка XLSX');return d;});}).then(function(d){state.undo=[];state.redo=[];toast('Импортировано: '+d.cells+' ячеек');return loadSheet(id);});});};input.click();};
  $('import-csv').onclick=function(){var input=document.createElement('input');input.type='file';input.accept='.csv,text/csv';input.onchange=function(){var file=input.files[0];if(!file)return;if(!confirm('Заменить ВСЁ содержимое таблицы данными CSV? Форматирование будет сброшено.'))return;if(file.size>16*1024*1024){toast('CSV больше 16 МиБ');return;}
  safe(function(){return fetch('/api/sheets/'+id+'/csv',{method:'POST',credentials:'same-origin',headers:{'X-ITSO-CSRF':state.csrf,'Content-Type':'text/csv'},body:file}).then(function(r){return r.json().then(function(d){if(!r.ok)throw Error(d.error||'Ошибка импорта');return d;});}).then(function(d){state.undo=[];state.redo=[];toast('Импортировано: '+d.cells+' ячеек');return loadSheet(id);});});};input.click();};}
 
@@ -214,6 +221,7 @@ function showChat(messages){var box=$('chat-messages');box.dataset.first=message
  (edit?'<button data-edit="'+m.id+'">Править</button>':'')+(state.user.role==='admin'?'<button data-delete="'+m.id+'">Удалить</button>':'')+'<div>'+escapeHtml(m.body)+'</div>'+(m.file_id?'<div><a href="/api/files/'+escapeHtml(m.file_id)+'">Вложение: '+escapeHtml(m.file_name)+'</a></div>':'')+'</div>';}).join('');box.scrollTop=box.scrollHeight;
  box.querySelectorAll('[data-edit]').forEach(function(b){b.onclick=function(){var id=Number(this.dataset.edit);var m=messages.find(function(x){return x.id===id;});var text=prompt('Изменить сообщение:',m.body);if(text!==null)safe(function(){return query('/api/chat/'+id,{method:'PUT',body:{body:text}}).then(renderChat);});};});
  box.querySelectorAll('[data-delete]').forEach(function(b){b.onclick=function(){var id=this.dataset.delete;if(confirm('Удалить сообщение?'))safe(function(){return query('/api/chat/'+id,{method:'DELETE',body:{}}).then(renderChat);});};});}
+$('remote-change').onclick=function(){navigate(state.view);};
 $('login-btn').onclick=login;$('login-password').onkeydown=function(e){if(e.key==='Enter')login();};
 $('logout-btn').onclick=function(){safe(function(){return query('/api/logout',{method:'POST',body:{}}).then(showLogin);});};
 document.querySelectorAll('[data-view]').forEach(function(b){b.onclick=function(){navigate(this.dataset.view);};});

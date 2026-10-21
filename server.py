@@ -6,6 +6,7 @@ import csv
 import io
 import zipfile
 import tempfile
+import xlsx_io
 import contextlib
 import datetime as dt
 import hashlib
@@ -81,6 +82,7 @@ class DB:
         self.path = self.root / 'itso.db'
         self.lock = threading.RLock()
         self.upload_lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
         with self.tx() as c:
             c.execute('PRAGMA journal_mode=WAL')
             c.executescript('''
@@ -120,11 +122,17 @@ class DB:
             CREATE TABLE IF NOT EXISTS chat_reads (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS search_history (user_id INTEGER NOT NULL, q TEXT NOT NULL,
                 searched INTEGER NOT NULL, PRIMARY KEY(user_id,q));
+            CREATE TABLE IF NOT EXISTS change_seq (id INTEGER PRIMARY KEY, rev INTEGER NOT NULL);
+            INSERT OR IGNORE INTO change_seq(id,rev) VALUES(1,0);
             CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
             CREATE INDEX IF NOT EXISTS idx_chat_created ON chat(id DESC);
             CREATE INDEX IF NOT EXISTS idx_obj_map ON map_objects(map_id);
             CREATE INDEX IF NOT EXISTS idx_links_map ON map_links(map_id);
             ''')
+            for table in ('sheets','cells','maps','map_objects','map_links','files','chat','file_refs','property_links'):
+                for operation in ('INSERT','UPDATE','DELETE'):
+                    c.execute('''CREATE TRIGGER IF NOT EXISTS update_{}_{} AFTER {} ON {} BEGIN
+                       UPDATE change_seq SET rev=rev+1 WHERE id=1; END'''.format(table,operation.lower(),operation,table))
 
     @contextlib.contextmanager
     def tx(self):
@@ -135,12 +143,27 @@ class DB:
             c.execute('PRAGMA busy_timeout=20000')
             try:
                 yield c
+                modified=c.total_changes>0
                 c.commit()
+                if modified:
+                    with self.changed:self.changed.notify_all()
             except Exception:
                 c.rollback()
                 raise
             finally:
                 c.close()
+
+    def revision(self):
+        with self.tx() as c:
+            return c.execute('SELECT rev FROM change_seq WHERE id=1').fetchone()['rev']
+
+    def wait_revision(self,since,timeout=20):
+        # Blocking long poll: no periodic DB reads until another writer commits.
+        with self.changed:
+            rev=self.revision()
+            if rev<=since:
+                self.changed.wait(timeout=timeout)
+            return self.revision()
 
     def admin_exists(self):
         with self.tx() as c:
@@ -736,6 +759,27 @@ class DB:
                     c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(props),linked['object_id']))
         return {'cells':len(rows)}
 
+    def xlsx_export(self,sid):
+        d=self.sheet(sid)
+        return xlsx_io.export_xlsx(d['cells'],d['sheet']['title'])
+
+    def xlsx_import(self,sid,blob):
+        try:cells=xlsx_io.import_xlsx(blob)
+        except (ValueError,zipfile.BadZipFile,KeyError,OverflowError) as e:
+            raise Failure('Неподдерживаемый или повреждённый XLSX: '+str(e))
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM sheets WHERE id=?',(sid,)).fetchone():raise Failure('Таблица не найдена',404)
+            c.execute('DELETE FROM cells WHERE sheet_id=?',(sid,))
+            c.executemany('INSERT INTO cells(sheet_id,row_no,col_no,value,style,revision) VALUES(?,?,?,?,?,1)',
+                          ((sid,row,col,value,dump(style)) for row,col,value,style in cells))
+            for linked in c.execute('SELECT object_id,prop_name,row_no,col_no FROM property_links WHERE sheet_id=?',(sid,)).fetchall():
+                cell=c.execute('SELECT value FROM cells WHERE sheet_id=? AND row_no=? AND col_no=?',(sid,linked['row_no'],linked['col_no'])).fetchone()
+                o=c.execute('SELECT properties FROM map_objects WHERE id=?',(linked['object_id'],)).fetchone()
+                if o:
+                    p=json.loads(o['properties']);p[linked['prop_name']]=cell['value'] if cell else ''
+                    c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(p),linked['object_id']))
+        return {'cells':len(cells)}
+
     def update_map(self,mid,title,folder=''):
         if not check_name(title) or not isinstance(folder,str) or len(folder)>150:raise Failure('Недопустимое название')
         with self.tx() as c:
@@ -978,6 +1022,12 @@ class Handler(BaseHTTPRequestHandler):
             body=self.body(); result=db.auth(str(body.get('name','')),str(body.get('password','')))
             token=result.pop('token')
             return self.json_response(result,headers={'Set-Cookie':'{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}'.format(COOKIE,token,SESSION_SECONDS)})
+        if path=='/api/revision' and method=='GET':
+            self.user();return self.json_response({'rev':db.revision()})
+        if path=='/api/changes' and method=='GET':
+            self.user()
+            since=max(0,int(qs.get('since',['0'])[0]))
+            return self.json_response({'rev':db.wait_revision(since)})
         if path=='/api/me' and method=='GET':
             u=self.user();return self.json_response({'id':u['id'],'name':u['name'],'role':u['role'],'csrf':u['csrf'],'expires':u['expires']})
         u=self.user(write=method in ('POST','PUT','DELETE'))
@@ -1010,6 +1060,17 @@ class Handler(BaseHTTPRequestHandler):
             n=int(self.headers.get('Content-Length','-1'))
             if n<0 or n>16*1024*1024:raise Failure('CSV ограничен 16 МиБ',413)
             return self.json_response(db.csv_import(int(m.group(1)),self.rfile.read(n)))
+        m=re.fullmatch(r'/api/sheets/(\d+)/xlsx',path)
+        if m and method=='GET':
+            content=db.xlsx_export(int(m.group(1)))
+            self.send_response(200);self.send_header('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            self.send_header('Content-Disposition','attachment; filename="table.xlsx"')
+            self.send_header('Content-Length',str(len(content)));self.end_headers();self.wfile.write(content);return
+        if m and method=='POST':
+            self.user(editor=True)
+            n=int(self.headers.get('Content-Length','-1'))
+            if n<=0 or n>16*1024*1024:raise Failure('XLSX ограничен 16 МиБ за импорт',413)
+            return self.json_response(db.xlsx_import(int(m.group(1)),self.rfile.read(n)))
         if path=='/api/maps' and method=='GET':return self.json_response(db.list_maps())
         if path=='/api/maps' and method=='POST':
             self.user(editor=True);d=self.body();return self.json_response({'id':db.add_map(d.get('title'),d.get('folder',''))},201)
@@ -1215,7 +1276,6 @@ def main(argv=None):
     p.add_argument('--init-admin',action='store_true',help='Create the first admin interactively')
     p.add_argument('--add-user',action='store_true',help='Add a user after checking administrator credentials')
     p.add_argument('--backup-now',action='store_true',help='Create an immediate backup')
-    p.add_argument('--verify-backups',action='store_true',help='Inspect backup integrity and attachments')
     p.add_argument('--export-archive',help='Create portable validated complete ZIP archive at target path')
     p.add_argument('--restore-archive',help='Restore ZIP archive OFFLINE; requires admin password')
     args=p.parse_args(argv)
@@ -1260,12 +1320,6 @@ def main(argv=None):
         db.restore_archive(args.restore_archive);print('Восстановлено. Перезапустите сервер.');return
     if args.backup_now:
         print('Резервная копия:', db.backup())
-        return
-    if args.verify_backups:
-        results = [db.verify_backup(stamp) for stamp in db.list_backups()]
-        print(dump({'checked':len(results),'backups':results}))
-        if any(not result['ok'] for result in results):
-            raise SystemExit(2)
         return
     stop=threading.Event()
     worker=threading.Thread(target=hourly_backup,args=(db,stop),daemon=True)
