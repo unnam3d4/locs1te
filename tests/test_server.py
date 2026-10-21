@@ -65,6 +65,53 @@ class DatabaseTests(unittest.TestCase):
         self.db.delete_file(first['id'])
         self.assertTrue((self.db.backups/snap/'uploads'/first['id']).exists())
 
+    def test_resumable_upload_crash_retry_duplicate_name_and_owner(self):
+        data=b'first-chunk and remaining-chunk'
+        first=self.db.start_upload(1,'Фото камеры.jpg',len(data))
+        fid=first['id']
+        half=11
+        self.assertEqual(self.db.append_upload(1,fid,0,io.BytesIO(data[:half]),half)['received'],half)
+        with self.assertRaises(server.Failure) as conflict:
+            self.db.append_upload(1,fid,0,io.BytesIO(b'wrong'),5)
+        self.assertEqual(conflict.exception.status,409)
+        with self.assertRaises(server.Failure):
+            self.db.upload_state(200,fid)
+        # Opening the database again simulates a server restart.
+        reopened=server.DB(self.temp.name)
+        self.assertEqual(reopened.upload_state(1,fid)['received'],half)
+        with self.assertRaises(server.Failure):
+            reopened.append_upload(1,fid,half,io.BytesIO(b'x'),4)
+        self.assertEqual(reopened.upload_state(1,fid)['received'],half)
+        reopened.append_upload(1,fid,half,io.BytesIO(data[half:]),len(data)-half)
+        done=reopened.finish_upload(1,fid)
+        self.assertEqual((reopened.files/fid).read_bytes(),data)
+        self.assertEqual(done['name'],'Фото камеры.jpg')
+        self.assertEqual(reopened.list_files()[0]['byte_length'],len(data))
+        other=reopened.start_upload(1,'Фото камеры.jpg',0)
+        second=reopened.finish_upload(1,other['id'])
+        self.assertEqual(second['name'],'Фото камеры (2).jpg')
+        completed=reopened.upload_state(1,fid)
+        self.assertTrue(completed['complete'])
+        self.assertEqual(reopened.finish_upload(1,fid)['id'],fid)
+        self.assertEqual(len(reopened.list_files()),2)
+
+    def test_resumable_upload_validation_cleanup_and_no_file_size_limit(self):
+        for size in (-1,'4',True,2**63):
+            with self.assertRaises(server.Failure):self.db.start_upload(1,'test.txt',size)
+        big=self.db.start_upload(1,'very_large.bin',6*1024*1024*1024)
+        self.assertEqual(big['size'],6*1024*1024*1024)
+        with self.assertRaises(server.Failure):
+            self.db.append_upload(1,big['id'],0,io.BytesIO(b'x'),server.UPLOAD_CHUNK+1)
+        with self.assertRaises(server.Failure):self.db.finish_upload(1,big['id'])
+        with self.assertRaises(server.Failure):self.db.cancel_upload(99,big['id'])
+        self.db.cancel_upload(1,big['id'])
+        self.assertFalse((self.db.files/(big['id']+'.part')).exists())
+        expired=self.db.start_upload(1,'stale.dat',1)
+        with self.db.tx() as c:
+            c.execute('UPDATE uploads_pending SET updated=0 WHERE id=?',(expired['id'],))
+        self.assertEqual(self.db.cleanup_pending_uploads(),1)
+        self.assertFalse((self.db.files/(expired['id']+'.part')).exists())
+
     def test_chat_edit_author_only(self):
         self.db.create_user('viewer', 'password000', 'observer')
         user = {'id':2, 'role':'observer'}
@@ -100,6 +147,27 @@ class HttpTests(unittest.TestCase):
         result={'status':res.status,'headers':dict(res.getheaders()),'body':blob}
         conn.close()
         return result
+
+    def test_resumable_upload_http_and_csrf(self):
+        login=self.request('POST','/api/login',{'name':'admin','password':'secretpassword'})
+        payload=json.loads(login['body']);cookie=login['headers']['Set-Cookie'].split(';',1)[0]
+        h={'Cookie':cookie,'X-ITSO-CSRF':payload['csrf']}
+        start=self.request('POST','/api/uploads',{'name':'photo.png','size':5},dict(h))
+        self.assertEqual(start['status'],201)
+        fid=json.loads(start['body'])['id']
+        denied=self.request('PUT','/api/uploads/'+fid,b'abc',{'Cookie':cookie,'X-Upload-Offset':'0'})
+        self.assertEqual(denied['status'],403)
+        first=self.request('PUT','/api/uploads/'+fid,b'ab',dict(h,**{'X-Upload-Offset':'0'}))
+        self.assertEqual(first['status'],200)
+        self.assertEqual(json.loads(first['body'])['received'],2)
+        fail=self.request('POST','/api/uploads/'+fid+'/finish',{},dict(h))
+        self.assertEqual(fail['status'],409)
+        second=self.request('PUT','/api/uploads/'+fid,b'cde',dict(h,**{'X-Upload-Offset':'2'}))
+        self.assertEqual(second['status'],200)
+        final=self.request('POST','/api/uploads/'+fid+'/finish',{},dict(h))
+        self.assertEqual(final['status'],201)
+        fetched=self.request('GET','/api/files/'+fid,None,{'Cookie':cookie})
+        self.assertEqual(fetched['body'],b'abcde')
 
     def test_login_permissions_csrf_and_files(self):
         login=self.request('POST','/api/login',{'name':'admin','password':'secretpassword'})

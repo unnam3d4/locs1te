@@ -12,8 +12,9 @@ function status(s){$('status').textContent=s;}
 function query(path,opts){opts=opts||{};var init={method:opts.method||'GET',credentials:'same-origin',headers:{'X-ITSO-CSRF':state.csrf}};
   if(opts.body!==undefined){init.headers['Content-Type']='application/json';init.body=JSON.stringify(opts.body);}
   if(opts.file){init.headers['X-Filename']=encodeURIComponent(opts.file.name);init.body=opts.file;init.method='POST';}
+  if(opts.raw){init.body=opts.raw;init.headers['Content-Type']='application/octet-stream';init.headers['X-Upload-Offset']=String(opts.offset);}
   return fetch(path,init).then(function(r){return r.json().catch(function(){return {error:'Неверный ответ сервера'};}).then(function(d){
-    if(!r.ok)throw Error(d.error||('HTTP '+r.status));return d;});}).catch(function(e){
+    if(!r.ok){var error=Error(d.error||('HTTP '+r.status));error.httpStatus=r.status;throw error;}return d;});}).catch(function(e){
     if(/Войдите в систему/.test(e.message)){showLogin();}throw e;
   });}
 function safe(fn){return Promise.resolve().then(fn).catch(function(e){toast(e.message||String(e));status('Ошибка: '+(e.message||e));});}
@@ -131,12 +132,32 @@ function deleteSelected(){var id=state.selectedObject;if(!id){toast('Выбер�
  return query('/api/maps/'+state.currentMap+'/objects/'+id,{method:'DELETE',body:{delete_links:true}}).then(function(){state.selectedObject=null;$('map-properties').hidden=true;return loadMap(state.currentMap);});}
 function pingSelected(){var id=state.selectedObject;if(!id){toast('Выберите объект');return Promise.resolve();}var obj=state.mapData.objects.find(function(o){return o.id===id;});var ip=prompt('IPv4 для однократной проверки PING:',obj.properties.IP||'');
  if(!ip)return Promise.resolve();status('Проверка ICMP...');return query('/api/ping',{method:'POST',body:{ip:ip}}).then(function(d){toast(d.reachable?'Получен ответ ICMP':'Нет ответа ICMP');});}
+// Files are sent in small independently confirmed chunks. The upload identifier is
+// stored per user/file so reselecting the same local file can resume after a LAN outage.
+function uploadFile(file){
+ var partSize=1024*1024;
+ var key='itso-upload:'+state.user.id+':'+file.name+':'+file.size+':'+file.lastModified;
+ function cached(){try{return localStorage.getItem(key);}catch(e){return null;}}
+ function remember(value){try{if(value)localStorage.setItem(key,value);else localStorage.removeItem(key);}catch(e){}}
+ function fresh(){return query('/api/uploads',{method:'POST',body:{name:file.name,size:file.size}}).then(function(d){remember(d.id);return d;});}
+ function stateForId(id){if(!id)return fresh();return query('/api/uploads/'+id).catch(function(e){if(e.httpStatus===404){remember(null);return fresh();}throw e;});}
+ function next(d){
+   if(d.received>=d.size){return query('/api/uploads/'+d.id+'/finish',{method:'POST',body:{}}).then(function(done){remember(null);return done;});}
+   var end=Math.min(d.size,d.received+partSize);
+   status('Загрузка '+file.name+': '+Math.floor(100*d.received/Math.max(1,d.size))+'%');
+   return query('/api/uploads/'+d.id,{method:'PUT',raw:file.slice(d.received,end),offset:d.received}).then(next);
+ }
+ return stateForId(cached()).then(function(d){
+   if(d.complete){remember(null);return d;}
+   return next(d);
+ });
+}
 function renderFiles(){return query('/api/files').then(function(files){if(state.view!=='files')return;
  $('panel').innerHTML='<div class="toolbar"><strong>Общий список файлов</strong><span class="spacer"></span><input id="upload" type="file" multiple></div><div class="box flex-grow" id="filebox"></div>';
  var h='<table class="file-table"><thead><tr><th>Имя файла</th><th>Размер</th><th>Загрузил</th><th>Действия</th></tr></thead><tbody>';
  files.forEach(function(f){h+='<tr><td>'+escapeHtml(f.name)+'</td><td>'+human(f.byte_length)+'</td><td>'+escapeHtml(f.owner)+'</td><td><a href="/api/files/'+escapeHtml(f.id)+'">Скачать</a>'+(state.user.role==='admin'?' <button class="small" data-delete="'+f.id+'">Удалить</button>':'')+'</td></tr>';});
  $('filebox').innerHTML=h+'</tbody></table>';
- $('upload').onchange=function(){var items=Array.from(this.files);var work=Promise.resolve();items.forEach(function(file){work=work.then(function(){status('Загрузка: '+file.name);return query('/api/files',{file:file});});});safe(function(){return work.then(function(){status('Файлы загружены');return renderFiles();});});};
+ $('upload').onchange=function(){var items=Array.from(this.files);var work=Promise.resolve();items.forEach(function(file){work=work.then(function(){status('Загрузка: '+file.name);return uploadFile(file);});});safe(function(){return work.then(function(){status('Файлы загружены');return renderFiles();});});};
  $('filebox').querySelectorAll('[data-delete]').forEach(function(b){b.onclick=function(){var id=this.dataset.delete;if(!confirm('Окончательно удалить файл?'))return;safe(function(){return query('/api/files/'+id,{method:'DELETE',body:{}}).then(renderFiles);});};});
  });}
 function human(n){var units=['Б','КБ','МБ','ГБ','ТБ'];var i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+units[i];}
