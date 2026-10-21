@@ -2,6 +2,10 @@
 HTTP is intentionally unencrypted per project decision. NEVER expose to the Internet.
 """
 import argparse
+import csv
+import io
+import zipfile
+import tempfile
 import contextlib
 import datetime as dt
 import hashlib
@@ -101,6 +105,21 @@ class DB:
                 updated INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
                 body TEXT NOT NULL, created INTEGER NOT NULL, edited INTEGER);
+            CREATE TABLE IF NOT EXISTS property_links (object_id TEXT NOT NULL, prop_name TEXT NOT NULL,
+                sheet_id INTEGER NOT NULL, row_no INTEGER NOT NULL, col_no INTEGER NOT NULL,
+                PRIMARY KEY(object_id,prop_name));
+            CREATE INDEX IF NOT EXISTS idx_property_cells ON property_links(sheet_id,row_no,col_no);
+            CREATE TABLE IF NOT EXISTS map_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, map_id INTEGER NOT NULL,
+                title TEXT NOT NULL, created INTEGER NOT NULL, content TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS file_refs (file_id TEXT NOT NULL, object_id TEXT, chat_id INTEGER,
+                CHECK ((object_id IS NOT NULL AND chat_id IS NULL) OR (object_id IS NULL AND chat_id IS NOT NULL)));
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_file_object ON file_refs(file_id,object_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_file_chat ON file_refs(file_id,chat_id);
+            CREATE INDEX IF NOT EXISTS idx_ref_object ON file_refs(object_id);
+            CREATE INDEX IF NOT EXISTS idx_ref_chat ON file_refs(chat_id);
+            CREATE TABLE IF NOT EXISTS chat_reads (user_id INTEGER PRIMARY KEY, last_id INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS search_history (user_id INTEGER NOT NULL, q TEXT NOT NULL,
+                searched INTEGER NOT NULL, PRIMARY KEY(user_id,q));
             CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
             CREATE INDEX IF NOT EXISTS idx_chat_created ON chat(id DESC);
             CREATE INDEX IF NOT EXISTS idx_obj_map ON map_objects(map_id);
@@ -195,6 +214,12 @@ class DB:
             c.execute('''INSERT INTO cells(sheet_id,row_no,col_no,value,style,revision) VALUES(?,?,?,?,?,?)
                  ON CONFLICT(sheet_id,row_no,col_no) DO UPDATE SET value=excluded.value,
                  style=excluded.style,revision=excluded.revision''', (sheet_id,row,col,value,dump(style),rev+1))
+            # Linked equipment receives the same committed value atomically.
+            for linked in c.execute('SELECT object_id,prop_name FROM property_links WHERE sheet_id=? AND row_no=? AND col_no=?',(sheet_id,row,col)).fetchall():
+                o=c.execute('SELECT properties FROM map_objects WHERE id=?',(linked['object_id'],)).fetchone()
+                if o:
+                    props=json.loads(o['properties']);props[linked['prop_name']]=value
+                    c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(props),linked['object_id']))
             return rev+1
 
     def list_maps(self):
@@ -237,6 +262,25 @@ class DB:
             else:
                 c.execute('INSERT INTO map_objects(id,map_id,x,y,properties,appearance,revision) VALUES(?,?,?,?,?,?,1)',
                           (oid,map_id,x,y,dump(props),dump(appearance)))
+            # For a property-to-cell link, editing the object also updates its cell.
+            # Revision increments let another user's stale edit fail with HTTP 409.
+            for linked in c.execute('SELECT prop_name,sheet_id,row_no,col_no FROM property_links WHERE object_id=?',(oid,)).fetchall():
+                val=str(props.get(linked['prop_name'],''))
+                cell=c.execute('SELECT value,style,revision FROM cells WHERE sheet_id=? AND row_no=? AND col_no=?',
+                               (linked['sheet_id'],linked['row_no'],linked['col_no'])).fetchone()
+                if cell and cell['value']==val:continue
+                if cell:
+                    c.execute('UPDATE cells SET value=?,revision=revision+1 WHERE sheet_id=? AND row_no=? AND col_no=?',
+                              (val,linked['sheet_id'],linked['row_no'],linked['col_no']))
+                else:
+                    c.execute('INSERT INTO cells(sheet_id,row_no,col_no,value,style,revision) VALUES(?,?,?,?,?,1)',
+                              (linked['sheet_id'],linked['row_no'],linked['col_no'],val,'{}'))
+                for peer in c.execute('SELECT object_id,prop_name FROM property_links WHERE sheet_id=? AND row_no=? AND col_no=? AND object_id!=?',
+                                      (linked['sheet_id'],linked['row_no'],linked['col_no'],oid)).fetchall():
+                    p=c.execute('SELECT properties FROM map_objects WHERE id=?',(peer['object_id'],)).fetchone()
+                    if p:
+                        other=json.loads(p['properties']);other[peer['prop_name']]=val
+                        c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(other),peer['object_id']))
         return {'id':oid,'revision':rev+1}
 
     def add_link(self,map_id,source,target):
@@ -257,6 +301,8 @@ class DB:
                 raise Failure('Сохранение свободных концов линий пока не реализовано',501)
             c.execute('DELETE FROM map_links WHERE from_id=? OR to_id=?',(oid,oid))
             c.execute('DELETE FROM map_objects WHERE id=?',(oid,))
+            c.execute('DELETE FROM file_refs WHERE object_id=?',(oid,))
+            c.execute('DELETE FROM property_links WHERE object_id=?',(oid,))
 
     def list_files(self):
         with self.tx() as c:
@@ -433,19 +479,26 @@ class DB:
         with self.tx() as c:
             if not c.execute('SELECT 1 FROM files WHERE id=?',(fid,)).fetchone():raise Failure('Файл не найден',404)
             c.execute('DELETE FROM files WHERE id=?',(fid,))
+            c.execute('DELETE FROM file_refs WHERE file_id=?',(fid,))
             try:(self.files/fid).unlink()
             except FileNotFoundError:pass
 
-    def send_chat(self,user_id,body):
-        if not isinstance(body,str) or not body.strip() or len(body)>6000:raise Failure('Сообщение должно содержать от 1 до 6000 символов')
+    def send_chat(self,user_id,body,file_id=None):
+        if not isinstance(body,str) or (not body.strip() and not file_id) or len(body)>6000:raise Failure('Введите текст или прикрепите файл')
         with self.tx() as c:
-            return c.execute('INSERT INTO chat(user_id,body,created) VALUES(?,?,?)',(user_id,body.strip(),now())).lastrowid
+            if file_id and not c.execute('SELECT 1 FROM files WHERE id=?',(file_id,)).fetchone():
+                raise Failure('Файл для чата не найден',404)
+            mid=c.execute('INSERT INTO chat(user_id,body,created) VALUES(?,?,?)',(user_id,body.strip() or 'Вложение',now())).lastrowid
+            if file_id:c.execute('INSERT INTO file_refs(file_id,chat_id) VALUES(?,?)',(file_id,mid))
+            return mid
 
     def chat(self,before=0,limit=60):
         with self.tx() as c:
             where='WHERE ch.id<?' if before else ''
             params=(before,limit) if before else (limit,)
-            return [dict(r) for r in c.execute('''SELECT ch.id,u.name AS username,ch.user_id,ch.body,ch.created,ch.edited FROM chat ch
+            return [dict(r) for r in c.execute('''SELECT ch.id,u.name AS username,ch.user_id,ch.body,ch.created,ch.edited,
+                    f.id AS file_id,f.name AS file_name FROM chat ch
+                    LEFT JOIN file_refs fr ON fr.chat_id=ch.id LEFT JOIN files f ON f.id=fr.file_id
                     JOIN users u ON ch.user_id=u.id {} ORDER BY ch.id DESC LIMIT ?'''.format(where),params)][::-1]
 
     def edit_chat(self,user,mid,body):
@@ -457,7 +510,9 @@ class DB:
             c.execute('UPDATE chat SET body=?,edited=? WHERE id=?',(body.strip(),now(),mid))
 
     def delete_chat(self,mid):
-        with self.tx() as c:c.execute('DELETE FROM chat WHERE id=?',(mid,))
+        with self.tx() as c:
+            c.execute('DELETE FROM file_refs WHERE chat_id=?',(mid,))
+            c.execute('DELETE FROM chat WHERE id=?',(mid,))
 
     def search(self,q,page=1,section='all',scope='',exact=False):
         """Small-scale search MVP; future milestone replaces scans with indexed paging."""
@@ -511,6 +566,341 @@ class DB:
             if folder.is_dir() and folder.stat().st_mtime<cutoff:
                 shutil.rmtree(str(folder),ignore_errors=True)
         return stamp
+
+
+    def map_export(self,mid):
+        content=self.map(mid)
+        return {'format':'itmap','version':1,'title':content['map']['title'],
+                'objects':content['objects'],'links':content['links']}
+
+    def import_map(self,doc,title=None,folder=''):
+        if not isinstance(doc,dict) or doc.get('format')!='itmap' or doc.get('version')!=1:
+            raise Failure('Недопустимый формат .itmap')
+        title=title or doc.get('title','Импортированная карта')
+        if not check_name(title) or not isinstance(folder,str) or len(folder)>150:raise Failure('Недопустимое название')
+        objs=doc.get('objects',[]);links=doc.get('links',[])
+        if not isinstance(objs,list) or not isinstance(links,list) or len(objs)>20000 or len(links)>40000:
+            raise Failure('Слишком большая или некорректная карта')
+        src=set();decoded=[];decoded_links=[]
+        for obj in objs:
+            if not isinstance(obj,dict):raise Failure('Некорректный объект карты')
+            oid=obj.get('id')
+            x,y=obj.get('x'),obj.get('y')
+            if not isinstance(oid,str) or not re.fullmatch(r'[a-f0-9]{24}',oid) or oid in src:
+                raise Failure('Некорректный ID объекта')
+            if not all(isinstance(v,(int,float)) and not isinstance(v,bool) and abs(v)<=10000000 for v in (x,y)):
+                raise Failure('Недопустимые координаты')
+            props=obj.get('properties',{});appearance=obj.get('appearance',{})
+            if not isinstance(props,dict) or not isinstance(appearance,dict) or len(dump(props))>20000 or len(dump(appearance))>2048:
+                raise Failure('Недопустимые свойства')
+            src.add(oid);decoded.append((oid,x,y,props,appearance))
+        for link in links:
+            if not isinstance(link,dict) or link.get('from_id') not in src or link.get('to_id') not in src:
+                raise Failure('Соединение с отсутствующим объектом')
+            options=link.get('options',{})
+            if not isinstance(options,dict) or len(dump(options))>2048:raise Failure('Недопустимые свойства линии')
+            decoded_links.append((link['from_id'],link['to_id'],options))
+        with self.tx() as c:
+            mid=c.execute('INSERT INTO maps(title,folder,created) VALUES(?,?,?)',(title.strip(),folder,now())).lastrowid
+            mapping={}
+            for oid,x,y,props,appearance in decoded:
+                unique=secrets.token_hex(12);mapping[oid]=unique
+                c.execute('INSERT INTO map_objects(id,map_id,x,y,properties,appearance,revision) VALUES(?,?,?,?,?,?,1)',(unique,mid,x,y,dump(props),dump(appearance)))
+            for a,b,options in decoded_links:
+                c.execute('INSERT INTO map_links(id,map_id,from_id,to_id,options) VALUES(?,?,?,?,?)',
+                          (secrets.token_hex(12),mid,mapping[a],mapping[b],dump(options)))
+        return mid
+
+    def snapshot_map(self,mid,title):
+        if not check_name(title):raise Failure('Название контрольной точки должно содержать 1–80 символов')
+        doc=self.map_export(mid)
+        with self.tx() as c:
+            return c.execute('INSERT INTO map_snapshots(map_id,title,created,content) VALUES(?,?,?,?)',
+                             (mid,title,now(),dump(doc))).lastrowid
+
+    def map_snapshots(self,mid):
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM maps WHERE id=?',(mid,)).fetchone():raise Failure('Карта не найдена',404)
+            return [dict(r) for r in c.execute('SELECT id,title,created FROM map_snapshots WHERE map_id=? ORDER BY id DESC',(mid,))]
+
+    def restore_map_snapshot(self,mid,snapshot_id):
+        with self.tx() as c:
+            r=c.execute('SELECT content FROM map_snapshots WHERE id=? AND map_id=?',(snapshot_id,mid)).fetchone()
+            if not r:raise Failure('Контрольная точка не найдена',404)
+            doc=json.loads(r['content'])
+            old={r['id']:r['revision'] for r in c.execute('SELECT id,revision FROM map_objects WHERE map_id=?',(mid,))}
+            saved={o['id'] for o in doc['objects']}
+            for oid in old:
+                if oid not in saved:
+                    c.execute('DELETE FROM file_refs WHERE object_id=?',(oid,))
+                    c.execute('DELETE FROM property_links WHERE object_id=?',(oid,))
+            c.execute('DELETE FROM map_links WHERE map_id=?',(mid,))
+            c.execute('DELETE FROM map_objects WHERE map_id=?',(mid,))
+            for o in doc['objects']:
+                c.execute('INSERT INTO map_objects(id,map_id,x,y,properties,appearance,revision) VALUES(?,?,?,?,?,?,?)',
+                          (o['id'],mid,o['x'],o['y'],dump(o['properties']),dump(o['appearance']),old.get(o['id'],0)+1))
+            for l in doc['links']:
+                c.execute('INSERT INTO map_links(id,map_id,from_id,to_id,options) VALUES(?,?,?,?,?)',
+                          (l['id'],mid,l['from_id'],l['to_id'],dump(l.get('options',{}))))
+        return True
+
+    # Metadata management. Permanent removals never erase stored exchanger files.
+    def update_sheet(self, sid, title, folder=''):
+        if not check_name(title) or not isinstance(folder,str) or len(folder)>150:raise Failure('Недопустимое название')
+        with self.tx() as c:
+            if not c.execute('UPDATE sheets SET title=?,folder=? WHERE id=?',(title.strip(),folder.strip(),sid)).rowcount:
+                raise Failure('Таблица не найдена',404)
+
+    def delete_sheet(self,sid):
+        with self.tx() as c:
+            if not c.execute('DELETE FROM sheets WHERE id=?',(sid,)).rowcount:raise Failure('Таблица не найдена',404)
+            c.execute('DELETE FROM cells WHERE sheet_id=?',(sid,))
+            c.execute('DELETE FROM property_links WHERE sheet_id=?',(sid,))
+
+    def clone_sheet(self,sid,title,folder=''):
+        if not check_name(title) or not isinstance(folder,str) or len(folder)>150:raise Failure('Недопустимое название')
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM sheets WHERE id=?',(sid,)).fetchone():raise Failure('Таблица не найдена',404)
+            new=c.execute('INSERT INTO sheets(title,folder,created) VALUES(?,?,?)',(title.strip(),folder,now())).lastrowid
+            c.execute('INSERT INTO cells(sheet_id,row_no,col_no,value,style,revision) SELECT ?,row_no,col_no,value,style,1 FROM cells WHERE sheet_id=?',(new,sid))
+            return new
+
+    def csv_export(self,sid):
+        # RFC 4180 CSV, UTF-8 with BOM for Windows Excel.
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM sheets WHERE id=?',(sid,)).fetchone():raise Failure('Таблица не найдена',404)
+            cells=list(c.execute('SELECT row_no,col_no,value FROM cells WHERE sheet_id=? AND value!=? ORDER BY row_no,col_no',(sid,'')))
+        if cells and (max(r['row_no'] for r in cells)>99999 or max(r['col_no'] for r in cells)>1999):
+            raise Failure('Слишком большая таблица для экспорта CSV',413)
+        grid={ (r['row_no'],r['col_no']):r['value'] for r in cells }
+        output=io.StringIO(newline='')
+        writer=csv.writer(output)
+        for row in range((max(r['row_no'] for r in cells)+1) if cells else 0):
+            writer.writerow([grid.get((row,col),'') for col in range(max(r['col_no'] for r in cells)+1)])
+        return ('\ufeff'+output.getvalue()).encode('utf-8')
+
+    def csv_import(self,sid,data):
+        if len(data)>16*1024*1024:raise Failure('CSV ограничен 16 МиБ за импорт',413)
+        try:
+            reader=csv.reader(io.StringIO(data.decode('utf-8-sig'),newline=''))
+            rows=[]
+            for i,values in enumerate(reader):
+                if i>=100000 or len(values)>2000:raise Failure('CSV выходит за лимит ячеек',413)
+                for j,v in enumerate(values):
+                    if len(v)>20000:raise Failure('Слишком длинная ячейка',413)
+                    if v:rows.append((sid,i,j,v,'{}',1))
+        except (UnicodeError,csv.Error) as e:raise Failure('Ошибка чтения CSV: '+str(e))
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM sheets WHERE id=?',(sid,)).fetchone():raise Failure('Таблица не найдена',404)
+            # Explicitly destructive replacement, caller confirms in UI. Data + metadata transaction atomic.
+            c.execute('DELETE FROM cells WHERE sheet_id=?',(sid,))
+            c.execute('DELETE FROM property_links WHERE sheet_id=?',(sid,))
+            c.executemany('INSERT INTO cells(sheet_id,row_no,col_no,value,style,revision) VALUES(?,?,?,?,?,?)',rows)
+            for linked in c.execute('SELECT object_id,prop_name,row_no,col_no FROM property_links WHERE sheet_id=?',(sid,)).fetchall():
+                cell=c.execute('SELECT value FROM cells WHERE sheet_id=? AND row_no=? AND col_no=?',(sid,linked['row_no'],linked['col_no'])).fetchone()
+                obj=c.execute('SELECT properties FROM map_objects WHERE id=?',(linked['object_id'],)).fetchone()
+                if obj:
+                    props=json.loads(obj['properties']);props[linked['prop_name']]=cell['value'] if cell else ''
+                    c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(props),linked['object_id']))
+        return {'cells':len(rows)}
+
+    def update_map(self,mid,title,folder=''):
+        if not check_name(title) or not isinstance(folder,str) or len(folder)>150:raise Failure('Недопустимое название')
+        with self.tx() as c:
+            if not c.execute('UPDATE maps SET title=?,folder=? WHERE id=?',(title.strip(),folder.strip(),mid)).rowcount:raise Failure('Карта не найдена',404)
+
+    def delete_map(self,mid):
+        with self.tx() as c:
+            if not c.execute('DELETE FROM maps WHERE id=?',(mid,)).rowcount:raise Failure('Карта не найдена',404)
+            oids=[r['id'] for r in c.execute('SELECT id FROM map_objects WHERE map_id=?',(mid,))]
+            for oid in oids:
+                c.execute('DELETE FROM file_refs WHERE object_id=?',(oid,))
+                c.execute('DELETE FROM property_links WHERE object_id=?',(oid,))
+            c.execute('DELETE FROM map_objects WHERE map_id=?',(mid,))
+            c.execute('DELETE FROM map_links WHERE map_id=?',(mid,))
+            c.execute('DELETE FROM property_links WHERE object_id IN (SELECT id FROM map_objects WHERE map_id=?)',(mid,))
+            c.execute('DELETE FROM map_snapshots WHERE map_id=?',(mid,))
+
+    def clone_map(self,mid,title,folder=''):
+        if not check_name(title) or not isinstance(folder,str) or len(folder)>150:raise Failure('Недопустимое название')
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM maps WHERE id=?',(mid,)).fetchone():raise Failure('Карта не найдена',404)
+            new=c.execute('INSERT INTO maps(title,folder,created) VALUES(?,?,?)',(title.strip(),folder,now())).lastrowid
+            ids={}
+            for o in c.execute('SELECT * FROM map_objects WHERE map_id=?',(mid,)).fetchall():
+                oid=secrets.token_hex(12);ids[o['id']]=oid
+                c.execute('INSERT INTO map_objects(id,map_id,x,y,properties,appearance,revision) VALUES(?,?,?,?,?,?,1)',
+                          (oid,new,o['x'],o['y'],o['properties'],o['appearance']))
+            for l in c.execute('SELECT * FROM map_links WHERE map_id=?',(mid,)).fetchall():
+                if l['from_id'] in ids and l['to_id'] in ids:
+                    c.execute('INSERT INTO map_links(id,map_id,from_id,to_id,options) VALUES(?,?,?,?,?)',
+                              (secrets.token_hex(12),new,ids[l['from_id']],ids[l['to_id']],l['options']))
+            return new
+
+    def bindings(self,mid,oid):
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM map_objects WHERE map_id=? AND id=?',(mid,oid)).fetchone():raise Failure('Объект не найден',404)
+            return [dict(r) for r in c.execute('SELECT prop_name,sheet_id,row_no,col_no FROM property_links WHERE object_id=? ORDER BY prop_name',(oid,))]
+
+    def bind_property(self,mid,oid,key,sid,row,col,source='table'):
+        if not isinstance(key,str) or not 1<=len(key)<=80 or not (0<=row<100000 and 0<=col<16384) or source not in ('table','map'):
+            raise Failure('Недопустимая привязка')
+        with self.tx() as c:
+            obj=c.execute('SELECT properties FROM map_objects WHERE map_id=? AND id=?',(mid,oid)).fetchone()
+            if not obj:raise Failure('Объект не найден',404)
+            if not c.execute('SELECT 1 FROM sheets WHERE id=?',(sid,)).fetchone():raise Failure('Таблица не найдена',404)
+            p=json.loads(obj['properties'])
+            cell=c.execute('SELECT value,style,revision FROM cells WHERE sheet_id=? AND row_no=? AND col_no=?',(sid,row,col)).fetchone()
+            if source=='table':
+                val=cell['value'] if cell else ''
+                p[key]=val
+                c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(p),oid))
+            else:
+                val=str(p.get(key,''))
+                if cell:
+                    c.execute('UPDATE cells SET value=?,revision=revision+1 WHERE sheet_id=? AND row_no=? AND col_no=?',(val,sid,row,col))
+                else:
+                    c.execute('INSERT INTO cells(sheet_id,row_no,col_no,value,style,revision) VALUES(?,?,?,?,?,1)',(sid,row,col,val,'{}'))
+            c.execute('INSERT INTO property_links(object_id,prop_name,sheet_id,row_no,col_no) VALUES(?,?,?,?,?) '
+                      'ON CONFLICT(object_id,prop_name) DO UPDATE SET sheet_id=excluded.sheet_id,row_no=excluded.row_no,col_no=excluded.col_no',
+                      (oid,key,sid,row,col))
+            for r in c.execute('SELECT object_id,prop_name FROM property_links WHERE sheet_id=? AND row_no=? AND col_no=? AND object_id!=?',(sid,row,col,oid)).fetchall():
+                other=c.execute('SELECT properties FROM map_objects WHERE id=?',(r['object_id'],)).fetchone()
+                if other:
+                    props=json.loads(other['properties']);props[r['prop_name']]=val
+                    c.execute('UPDATE map_objects SET properties=?,revision=revision+1 WHERE id=?',(dump(props),r['object_id']))
+
+    def unbind_property(self,mid,oid,key):
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM map_objects WHERE map_id=? AND id=?',(mid,oid)).fetchone():raise Failure('Объект не найден',404)
+            c.execute('DELETE FROM property_links WHERE object_id=? AND prop_name=?',(oid,key))
+
+    def attach_file(self,mid,oid,fid):
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM map_objects WHERE map_id=? AND id=?',(mid,oid)).fetchone():raise Failure('Объект не найден',404)
+            if not c.execute('SELECT 1 FROM files WHERE id=?',(fid,)).fetchone():raise Failure('Файл не найден',404)
+            c.execute('INSERT OR IGNORE INTO file_refs(file_id,object_id) VALUES(?,?)',(fid,oid))
+
+    def object_files(self,mid,oid):
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM map_objects WHERE map_id=? AND id=?',(mid,oid)).fetchone():raise Failure('Объект не найден',404)
+            return [dict(r) for r in c.execute('SELECT f.id,f.name,f.byte_length FROM file_refs fr JOIN files f ON f.id=fr.file_id WHERE fr.object_id=? ORDER BY f.name',(oid,))]
+
+    def detach_file(self,mid,oid,fid):
+        with self.tx() as c:
+            if not c.execute('SELECT 1 FROM map_objects WHERE map_id=? AND id=?',(mid,oid)).fetchone():raise Failure('Объект не найден',404)
+            c.execute('DELETE FROM file_refs WHERE object_id=? AND file_id=?',(oid,fid))
+
+    def mark_chat_read(self,user_id,mid=None):
+        with self.tx() as c:
+            maximum=c.execute('SELECT COALESCE(MAX(id),0) AS n FROM chat').fetchone()['n']
+            mid=maximum if mid is None else max(0,min(maximum,int(mid)))
+            c.execute('INSERT INTO chat_reads(user_id,last_id) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_id=MAX(last_id,excluded.last_id)',(user_id,mid))
+
+    def unread_chat(self,user_id):
+        with self.tx() as c:
+            row=c.execute("SELECT COUNT(*) AS n FROM chat WHERE id>COALESCE((SELECT last_id FROM chat_reads WHERE user_id=?),0) AND user_id!=?",(user_id,user_id)).fetchone()
+            return row['n']
+
+    def save_search(self,user_id,q):
+        q=q.strip()
+        if not q or len(q)>160:return
+        with self.tx() as c:
+            c.execute('INSERT INTO search_history(user_id,q,searched) VALUES(?,?,?) ON CONFLICT(user_id,q) DO UPDATE SET searched=excluded.searched',(user_id,q,now()))
+            c.execute('DELETE FROM search_history WHERE user_id=? AND q NOT IN (SELECT q FROM search_history WHERE user_id=? ORDER BY searched DESC,rowid DESC LIMIT 20)',(user_id,user_id))
+
+    def history(self,user_id):
+        with self.tx() as c:return [r['q'] for r in c.execute('SELECT q FROM search_history WHERE user_id=? ORDER BY searched DESC,rowid DESC LIMIT 20',(user_id,))]
+
+    def delete_history(self,user_id,q=None):
+        with self.tx() as c:
+            if q is None:c.execute('DELETE FROM search_history WHERE user_id=?',(user_id,))
+            else:c.execute('DELETE FROM search_history WHERE user_id=? AND q=?',(user_id,q))
+
+    def export_archive(self, destination):
+        """Consistent snapshot of SQLite and completed uploads with SHA-256 manifest."""
+        destination=Path(destination).resolve()
+        if destination.parent==self.root or self.root in destination.parents:
+            raise Failure('Архив нельзя сохранять внутри каталога данных')
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='itso-export-') as work:
+            snapshot=Path(work)/'itso.db'
+            # Freeze logical metadata + file deletion while snapshot is collected.
+            with self.lock:
+                with contextlib.closing(sqlite3.connect(str(self.path))) as src,contextlib.closing(sqlite3.connect(str(snapshot))) as dest:
+                    src.backup(dest)
+                with self.tx() as c:files=[dict(r) for r in c.execute('SELECT id,byte_length FROM files')]
+                manifest={'version':1,'files':{},'created':now()}
+                stage=destination.with_name(destination.name+'.writing-'+secrets.token_hex(4))
+                try:
+                    with zipfile.ZipFile(str(stage),'w',compression=zipfile.ZIP_STORED,allowZip64=True) as z:
+                        def add(path,arc):
+                            digest=hashlib.sha256(); size=0
+                            with open(str(path),'rb') as src,z.open(arc,'w',force_zip64=True) as dst:
+                                for block in iter(lambda:src.read(1024*1024),b''):
+                                    digest.update(block);size+=len(block);dst.write(block)
+                            manifest['files'][arc]={'sha256':digest.hexdigest(),'size':size}
+                        add(snapshot,'itso.db')
+                        for f in files:
+                            path=self.files/f['id']
+                            if not path.is_file() or path.stat().st_size!=f['byte_length']:
+                                raise Failure('Файл вложения отсутствует или повреждён: '+f['id'])
+                            add(path,'uploads/'+f['id'])
+                        z.writestr('manifest.json',dump(manifest).encode('utf-8'))
+                    os.replace(str(stage),str(destination))
+                finally:
+                    if stage.exists():stage.unlink()
+        return str(destination)
+
+    def restore_archive(self, archive):
+        """Offline restore. Caller MUST ensure server process is stopped."""
+        archive=Path(archive).resolve()
+        if not archive.is_file():raise Failure('Архив не найден',404)
+        with tempfile.TemporaryDirectory(prefix='itso-restore-',dir=str(self.root.parent)) as tmp:
+            tmp=Path(tmp);dest=tmp/'new';dest.mkdir();(dest/'uploads').mkdir()
+            try:
+                with zipfile.ZipFile(str(archive)) as z:
+                    if z.namelist().count('manifest.json')!=1:raise Failure('Нет манифеста архива')
+                    meta=json.loads(z.read('manifest.json'))
+                    names=set(z.namelist())
+                    if meta.get('version')!=1 or not isinstance(meta.get('files'),dict) or names!=set(meta['files'])|{'manifest.json'}:
+                        raise Failure('Некорректный архив')
+                    if 'itso.db' not in meta['files']:raise Failure('Нет базы данных в архиве')
+                    for name,entry in meta['files'].items():
+                        if name!='itso.db' and not re.fullmatch(r'uploads/[a-f0-9]{40}',name):raise Failure('Недопустимый путь в архиве')
+                        if not isinstance(entry,dict) or not isinstance(entry.get('size'),int) or entry['size']<0 or not re.fullmatch(r'[a-f0-9]{64}',str(entry.get('sha256',''))):raise Failure('Некорректный манифест')
+                        if z.getinfo(name).file_size!=entry['size']:raise Failure('Размер файла архива не совпадает')
+                        digest=hashlib.sha256();received=0;target=dest/name
+                        with z.open(name) as src,open(str(target),'xb') as out:
+                            while True:
+                                block=src.read(1024*1024)
+                                if not block:break
+                                digest.update(block);received+=len(block);out.write(block)
+                        if received!=entry['size'] or digest.hexdigest()!=entry['sha256']:raise Failure('Повреждён файл архива: '+name)
+                with contextlib.closing(sqlite3.connect(str(dest/'itso.db'))) as check:
+                    if check.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise Failure('База данных в архиве повреждена')
+                    names={fid:length for fid,length in check.execute('SELECT id,byte_length FROM files')}
+                for fid,length in names.items():
+                    file=dest/'uploads'/fid
+                    if not file.is_file() or file.stat().st_size!=length:raise Failure('Не хватает вложения: '+fid)
+                if len(names)!=len(meta['files'])-1:raise Failure('Неизвестные вложения в архиве')
+            except (zipfile.BadZipFile,ValueError,sqlite3.DatabaseError,KeyError) as e:raise Failure('Архив не прошёл проверку: '+str(e))
+            # Use a local copy of the original for immediate rollback.
+            with self.lock:
+                old=tmp/'old';old.mkdir()
+                for ext in ('','-wal','-shm'):
+                    p=Path(str(self.path)+ext)
+                    if p.exists():shutil.move(str(p),str(old/p.name))
+                try:
+                    if self.files.exists():shutil.move(str(self.files),str(old/'uploads'))
+                    shutil.move(str(dest/'itso.db'),str(self.path))
+                    shutil.move(str(dest/'uploads'),str(self.files))
+                except Exception:
+                    if self.path.exists():self.path.unlink()
+                    if self.files.exists():shutil.rmtree(str(self.files))
+                    for entry in old.iterdir():shutil.move(str(entry),str(self.root/entry.name))
+                    raise
+        return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -572,11 +962,71 @@ class Handler(BaseHTTPRequestHandler):
             self.user(editor=True);d=self.body()
             rev=db.edit_cell(int(m.group(1)),int(d.get('row',-1)),int(d.get('col',-1)),d.get('value'),d.get('style',{}),d.get('revision',0))
             return self.json_response({'revision':rev})
+        m=re.fullmatch(r'/api/sheets/(\d+)',path)
+        if m and method=='PUT':
+            self.user(editor=True);d=self.body();db.update_sheet(int(m.group(1)),d.get('title'),d.get('folder',''));return self.json_response({'ok':True})
+        if m and method=='DELETE':
+            self.user(editor=True);db.delete_sheet(int(m.group(1)));return self.json_response({'ok':True})
+        m=re.fullmatch(r'/api/sheets/(\d+)/copy',path)
+        if m and method=='POST':
+            self.user(editor=True);d=self.body();return self.json_response({'id':db.clone_sheet(int(m.group(1)),d.get('title'),d.get('folder',''))},201)
+        m=re.fullmatch(r'/api/sheets/(\d+)/csv',path)
+        if m and method=='GET':
+            b=db.csv_export(int(m.group(1)));self.send_response(200);self.send_header('Content-Type','text/csv; charset=utf-8');self.send_header('Content-Disposition','attachment; filename="table.csv"');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
+        if m and method=='POST':
+            self.user(editor=True)
+            n=int(self.headers.get('Content-Length','-1'))
+            if n<0 or n>16*1024*1024:raise Failure('CSV ограничен 16 МиБ',413)
+            return self.json_response(db.csv_import(int(m.group(1)),self.rfile.read(n)))
         if path=='/api/maps' and method=='GET':return self.json_response(db.list_maps())
         if path=='/api/maps' and method=='POST':
             self.user(editor=True);d=self.body();return self.json_response({'id':db.add_map(d.get('title'),d.get('folder',''))},201)
         m=re.fullmatch(r'/api/maps/(\d+)',path)
         if m and method=='GET':return self.json_response(db.map(int(m.group(1))))
+        m=re.fullmatch(r'/api/maps/(\d+)',path)
+        if m and method=='PUT':
+            self.user(editor=True);d=self.body();db.update_map(int(m.group(1)),d.get('title'),d.get('folder',''));return self.json_response({'ok':True})
+        if m and method=='DELETE':
+            self.user(editor=True);db.delete_map(int(m.group(1)));return self.json_response({'ok':True})
+        m=re.fullmatch(r'/api/maps/(\d+)/export',path)
+        if m and method=='GET':
+            content=dump(db.map_export(int(m.group(1)))).encode('utf-8')
+            self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8')
+            self.send_header('Content-Disposition','attachment; filename="map.itmap"')
+            self.send_header('Content-Length',str(len(content)));self.end_headers();self.wfile.write(content);return
+        if path=='/api/maps/import' and method=='POST':
+            self.user(editor=True)
+            n=int(self.headers.get('Content-Length','-1'))
+            if n<=0 or n>16*1024*1024:raise Failure('Карта ограничена 16 МиБ за импорт',413)
+            try:doc=json.loads(self.rfile.read(n).decode('utf-8'))
+            except (ValueError,UnicodeError):raise Failure('Некорректный .itmap')
+            return self.json_response({'id':db.import_map(doc)},201)
+        m=re.fullmatch(r'/api/maps/(\d+)/snapshots',path)
+        if m and method=='GET':return self.json_response(db.map_snapshots(int(m.group(1))))
+        if m and method=='POST':
+            self.user(editor=True);d=self.body();return self.json_response({'id':db.snapshot_map(int(m.group(1)),d.get('title'))},201)
+        m=re.fullmatch(r'/api/maps/(\d+)/snapshots/(\d+)/restore',path)
+        if m and method=='POST':
+            self.user(editor=True);db.restore_map_snapshot(int(m.group(1)),int(m.group(2)));return self.json_response({'ok':True})
+        m=re.fullmatch(r'/api/maps/(\d+)/copy',path)
+        if m and method=='POST':
+            self.user(editor=True);d=self.body();return self.json_response({'id':db.clone_map(int(m.group(1)),d.get('title'),d.get('folder',''))},201)
+        m=re.fullmatch(r'/api/maps/(\d+)/objects/([a-f0-9]{24})/bindings',path)
+        if m and method=='GET':return self.json_response(db.bindings(int(m.group(1)),m.group(2)))
+        if m and method=='POST':
+            self.user(editor=True);d=self.body();db.bind_property(int(m.group(1)),m.group(2),d.get('property'),int(d.get('sheet_id',0)),int(d.get('row',-1)),int(d.get('col',-1)),d.get('source','table'));return self.json_response({'ok':True})
+        m=re.fullmatch(r'/api/maps/(\d+)/objects/([a-f0-9]{24})/bindings/(.+)',path)
+        if m and method=='DELETE':
+            self.user(editor=True)
+            from urllib.parse import unquote
+            db.unbind_property(int(m.group(1)),m.group(2),unquote(m.group(3)));return self.json_response({'ok':True})
+        m=re.fullmatch(r'/api/maps/(\d+)/objects/([a-f0-9]{24})/files',path)
+        if m and method=='GET':return self.json_response(db.object_files(int(m.group(1)),m.group(2)))
+        if m and method=='POST':
+            self.user(editor=True);d=self.body();db.attach_file(int(m.group(1)),m.group(2),d.get('file_id'));return self.json_response({'ok':True})
+        m=re.fullmatch(r'/api/maps/(\d+)/objects/([a-f0-9]{24})/files/([a-f0-9]{40})',path)
+        if m and method=='DELETE':
+            self.user(editor=True);db.detach_file(int(m.group(1)),m.group(2),m.group(3));return self.json_response({'ok':True})
         m=re.fullmatch(r'/api/maps/(\d+)/objects',path)
         if m and method=='PUT':
             self.user(editor=True);d=self.body();return self.json_response(db.save_object(int(m.group(1)),d.get('object',{}),d.get('revision',0)))
@@ -613,16 +1063,22 @@ class Handler(BaseHTTPRequestHandler):
         if m and method=='DELETE':
             self.user(admin=True);db.delete_file(m.group(1));return self.json_response({'ok':True})
         if m and method=='GET':return self.download(m.group(1))
+        if path=='/api/chat/unread' and method=='GET':return self.json_response({'count':db.unread_chat(u['id'])})
+        if path=='/api/chat/read' and method=='POST':
+            d=self.body();db.mark_chat_read(u['id'],d.get('last_id'));return self.json_response({'ok':True})
         if path=='/api/chat' and method=='GET':
             before=int(qs.get('before',['0'])[0]);return self.json_response(db.chat(before))
         if path=='/api/chat' and method=='POST':
-            d=self.body();return self.json_response({'id':db.send_chat(u['id'],d.get('body'))},201)
+            d=self.body();return self.json_response({'id':db.send_chat(u['id'],d.get('body'),d.get('file_id'))},201)
         m=re.fullmatch(r'/api/chat/(\d+)',path)
         if m and method=='PUT':d=self.body();db.edit_chat(u,int(m.group(1)),d.get('body'));return self.json_response({'ok':True})
         if m and method=='DELETE':self.user(admin=True);db.delete_chat(int(m.group(1)));return self.json_response({'ok':True})
+        if path=='/api/search/history' and method=='GET':return self.json_response(db.history(u['id']))
+        if path=='/api/search/history' and method=='DELETE':
+            d=self.body();db.delete_history(u['id'],d.get('q'));return self.json_response({'ok':True})
         if path=='/api/search' and method=='GET':
             q=qs.get('q',[''])[0];page=max(1,min(100000,int(qs.get('page',['1'])[0])))
-            return self.json_response(db.search(q,page,qs.get('section',['all'])[0],qs.get('scope',[''])[0],qs.get('exact',['0'])[0]=='1'))
+            db.save_search(u['id'],q);return self.json_response(db.search(q,page,qs.get('section',['all'])[0],qs.get('scope',[''])[0],qs.get('exact',['0'])[0]=='1'))
         if path=='/api/ping' and method=='POST':
             d=self.body();target=str(d.get('ip',''))
             import ipaddress
@@ -677,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type',MIME.get(file.suffix,'application/octet-stream'))
         self.send_header('X-Content-Type-Options','nosniff')
-        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
         self.send_header('Cache-Control','no-store')
         self.send_header('Content-Length',str(len(b)))
         self.end_headers();self.wfile.write(b)
@@ -727,6 +1183,8 @@ def main(argv=None):
     p.add_argument('--init-admin',action='store_true',help='Create the first admin interactively')
     p.add_argument('--add-user',action='store_true',help='Add a user after checking administrator credentials')
     p.add_argument('--backup-now',action='store_true',help='Create an immediate backup')
+    p.add_argument('--export-archive',help='Create portable validated complete ZIP archive at target path')
+    p.add_argument('--restore-archive',help='Restore ZIP archive OFFLINE; requires admin password')
     args=p.parse_args(argv)
     db=DB(args.data_dir)
     if args.init_admin:
@@ -754,6 +1212,19 @@ def main(argv=None):
         db.create_user(name, password, role)
         print('Пользователь создан')
         return
+    if args.export_archive:
+        import getpass
+        who=input('Администратор: ').strip();password=getpass.getpass('Пароль: ')
+        with db.tx() as c:r=c.execute("SELECT salt,password_hash FROM users WHERE name=? AND role='admin'",(who,)).fetchone()
+        if not r or not check_password(password,r['salt'],r['password_hash']):raise SystemExit('Недостаточно прав')
+        print('Полный архив:',db.export_archive(args.export_archive));return
+    if args.restore_archive:
+        import getpass
+        who=input('Администратор текущей базы: ').strip();password=getpass.getpass('Пароль: ')
+        with db.tx() as c:r=c.execute("SELECT salt,password_hash FROM users WHERE name=? AND role='admin'",(who,)).fetchone()
+        if not r or not check_password(password,r['salt'],r['password_hash']):raise SystemExit('Недостаточно прав')
+        if input('СЕРВЕР ДОЛЖЕН БЫТЬ ОСТАНОВЛЕН! Для подтверждения введите RESTORE: ')!='RESTORE':raise SystemExit('Отменено')
+        db.restore_archive(args.restore_archive);print('Восстановлено. Перезапустите сервер.');return
     if args.backup_now:
         print('Резервная копия:', db.backup())
         return
